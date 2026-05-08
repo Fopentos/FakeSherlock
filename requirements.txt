@@ -1,6 +1,5 @@
 python-telegram-bot>=20.0
 sherlock-project
-maigret
 holehe
 aiohttp
 beautifulsoup4
