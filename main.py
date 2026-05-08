@@ -1,183 +1,149 @@
 import os
 import re
-import json
 import logging
 import asyncio
-from datetime import datetime
-from typing import Dict, Any, List, Optional, Tuple
-from urllib.parse import quote_plus
+from typing import Dict, List, Any, Optional
 
-# Сторонние библиотеки
 import aiohttp
 import requests
 from bs4 import BeautifulSoup
 from fake_useragent import UserAgent
-
-# Telegram
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-
-# Ядра OSINT (должны быть в requirements.txt)
-try:
-    from sherlock import sherlock
-except ImportError:
-    sherlock = None
-
-try:
-    from maigret.maigret import search as maigret_search
-except ImportError:
-    maigret_search = None
-
-try:
-    from holehe.core import holehe
-except ImportError:
-    holehe = None
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 
 # Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("FakeSherlock")
 
-# ----------------------------------------------------------------------
-# КОНФИГУРАЦИЯ (все данные берутся из переменных окружения)
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# Конфигурация (все ключи из переменных окружения Railway)
+# ------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
+HIBP_API_KEY = os.environ.get("HIBP_API_KEY")           # Have I Been Pwned
+DEHASHED_API_KEY = os.environ.get("DEHASHED_API_KEY")   # DeHashed
+LEAKCHECK_API_KEY = os.environ.get("LEAKCHECK_API_KEY") # LeakCheck
+
 if not BOT_TOKEN:
-    raise ValueError("❌ Переменная окружения BOT_TOKEN не установлена! Без неё бот не запустится.")
+    raise ValueError("❌ BOT_TOKEN не найден!")
 
-# Опциональные API-ключи для расширенного функционала
-DEHASHED_API_KEY = os.environ.get("DEHASHED_API_KEY")
-LEAKCHECK_API_KEY = os.environ.get("LEAKCHECK_API_KEY")
-HIBP_API_KEY = os.environ.get("HIBP_API_KEY")
-PROXY_LIST = os.environ.get("PROXY_LIST")  # Прокси через запятую, например "http://1.1.1.1:8080,http://2.2.2.2:8080"
-
-# ----------------------------------------------------------------------
-# ВСПОМОГАТЕЛЬНЫЕ КЛАССЫ И ФУНКЦИИ
-# ----------------------------------------------------------------------
 ua = UserAgent()
 
-class AsyncRequests:
-    """Асинхронный HTTP-клиент с поддержкой прокси и повторных попыток."""
-
+# ------------------------------------------------------------
+# Асинхронный HTTP-клиент с прокси
+# ------------------------------------------------------------
+class HttpClient:
     def __init__(self):
         self.session = None
-        self.proxies = []
-        if PROXY_LIST:
-            self.proxies = [p.strip() for p in PROXY_LIST.split(",") if p.strip()]
 
-    async def init_session(self):
+    async def init(self):
         if self.session is None:
-            connector = aiohttp.TCPConnector(limit=100)
-            timeout = aiohttp.ClientTimeout(total=30)
-            self.session = aiohttp.ClientSession(connector=connector, timeout=timeout)
-        return self.session
+            self.session = aiohttp.ClientSession()
 
     async def close(self):
         if self.session:
             await self.session.close()
             self.session = None
 
-    async def get(self, url: str, headers: dict = None, proxy: str = None) -> Optional[str]:
-        await self.init_session()
-        if headers is None:
+    async def get(self, url: str, headers: dict = None) -> Optional[str]:
+        await self.init()
+        if not headers:
             headers = {"User-Agent": ua.random}
         try:
-            async with self.session.get(url, headers=headers, proxy=proxy, ssl=False) as resp:
+            async with self.session.get(url, headers=headers, timeout=15) as resp:
                 if resp.status == 200:
                     return await resp.text()
-                else:
-                    logger.warning(f"HTTP {resp.status} для {url}")
+                logger.warning(f"HTTP {resp.status} для {url}")
         except Exception as e:
-            logger.error(f"Ошибка при получении {url}: {e}")
+            logger.error(f"Ошибка GET {url}: {e}")
         return None
 
-    async def post(self, url: str, data: dict = None, json_data: dict = None, headers: dict = None) -> Optional[dict]:
-        await self.init_session()
-        if headers is None:
-            headers = {"User-Agent": ua.random}
-        try:
-            async with self.session.post(url, data=data, json=json_data, headers=headers, ssl=False) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                else:
-                    logger.warning(f"HTTP {resp.status} для {url}")
-        except Exception as e:
-            logger.error(f"Ошибка при запросе к {url}: {e}")
-        return None
+http = HttpClient()
 
-async_requests = AsyncRequests()
-
-# ----------------------------------------------------------------------
-# МОДУЛИ СБОРА ДАННЫХ
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# Модули поиска
+# ------------------------------------------------------------
 
 async def search_sherlock(username: str) -> Dict[str, str]:
-    """Поиск по 400+ соцсетям через Sherlock (если установлен)."""
-    if sherlock is None:
-        return {}
-    loop = asyncio.get_running_loop()
+    """400+ сайтов через Sherlock (синхронный, в отдельном потоке)."""
     try:
-        results = await loop.run_in_executor(None, lambda: sherlock(username, verbose=False, print_all=False))
-        if results:
-            return {site: url for site, url in results.items() if url}
+        import sherlock
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: sherlock.sherlock(username, verbose=False, print_all=False)
+        )
+        if isinstance(result, dict):
+            return {k: v for k, v in result.items() if v}
     except Exception as e:
-        logger.error(f"Ошибка Sherlock для {username}: {e}")
+        logger.error(f"Sherlock провалился: {e}")
     return {}
 
-async def search_maigret(username: str) -> Dict[str, Any]:
-    """Расширенный поиск по 3000+ сайтам через Maigret (если установлен)."""
-    if maigret_search is None:
-        return {}
-    loop = asyncio.get_running_loop()
+async def search_socialscan(username: str) -> List[str]:
+    """Дополнительные платформы через socialscan (легковесная утилита)."""
     try:
-        # Запускаем Maigret с базовыми настройками
-        results = await loop.run_in_executor(None, lambda: maigret_search(username))
-        if results and isinstance(results, dict):
-            return results
+        import socialscan.util
+        from socialscan.scan import scan
+        # socialscan ожидает список запросов Query(username, platform)
+        platforms = ["instagram", "twitter", "github", "pinterest", "reddit", "snapchat", "tumblr", "youtube"]
+        queries = [socialscan.util.Query(username, platform) for platform in platforms]
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(None, lambda: scan(queries))
+        found = []
+        for q, avail in results.items():
+            if avail is False:  # False означает, что профиль существует (занят)
+                found.append(q.platform.capitalize())
+        return found
     except Exception as e:
-        logger.error(f"Ошибка Maigret для {username}: {e}")
-    return {}
+        logger.error(f"Socialscan ошибка: {e}")
+        return []
 
-async def check_holehe(email: str) -> Dict[str, bool]:
-    """Проверка наличия email на 120+ платформах через Holehe."""
-    if holehe is None:
-        return {}
-    loop = asyncio.get_running_loop()
-    try:
-        # Holehe возвращает словарь {service: True/False}
-        results = await loop.run_in_executor(None, lambda: holehe(email))
-        if results and isinstance(results, dict):
-            return results
-    except Exception as e:
-        logger.error(f"Ошибка Holehe для {email}: {e}")
-    return {}
+async def direct_check_services(username: str) -> Dict[str, str]:
+    """Прямая проверка отдельных сервисов, если другие методы не сработали."""
+    checks = {
+        "GitHub": f"https://github.com/{username}",
+        "Instagram": f"https://www.instagram.com/{username}/",
+        "VK": f"https://vk.com/{username}",
+        "Twitter": f"https://twitter.com/{username}",
+        "Telegram": f"https://t.me/{username}",
+        "Steam": f"https://steamcommunity.com/id/{username}",
+    }
+    results = {}
+    for name, url in checks.items():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers={"User-Agent": ua.random}, timeout=10) as resp:
+                    if resp.status == 200:
+                        results[name] = url
+        except:
+            pass
+    return results
 
-async def find_potential_emails(username: str) -> List[str]:
-    """Пытается найти возможные email по нику через утечки и API."""
+async def find_emails_from_username(username: str) -> List[str]:
+    """Поиск email'ов через DeHashed и LeakCheck (требуются API-ключи)."""
     emails = []
-    # Проверка через DeHashed API
     if DEHASHED_API_KEY:
         headers = {"Authorization": f"Bearer {DEHASHED_API_KEY}"}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://api.dehashed.com/search?query=username:{username}", headers=headers) as resp:
+                async with session.get(
+                    f"https://api.dehashed.com/search?query=username:{username}",
+                    headers=headers, timeout=20
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
-                        if data.get("entries"):
-                            for entry in data["entries"]:
-                                if entry.get("email"):
-                                    emails.append(entry["email"])
+                        for entry in data.get("entries", []):
+                            if entry.get("email"):
+                                emails.append(entry["email"])
         except Exception as e:
-            logger.error(f"Ошибка DeHashed API: {e}")
-
-    # Проверка через LeakCheck API
+            logger.error(f"DeHashed error: {e}")
     if LEAKCHECK_API_KEY:
         headers = {"X-API-Key": LEAKCHECK_API_KEY}
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(f"https://leakcheck.io/api/v2/query/{username}", headers=headers) as resp:
+                async with session.get(
+                    f"https://leakcheck.io/api/v2/query/{username}",
+                    headers=headers, timeout=20
+                ) as resp:
                     if resp.status == 200:
                         data = await resp.json()
                         if data.get("success") and data.get("result"):
@@ -185,340 +151,254 @@ async def find_potential_emails(username: str) -> List[str]:
                                 if entry.get("email"):
                                     emails.append(entry["email"])
         except Exception as e:
-            logger.error(f"Ошибка LeakCheck API: {e}")
+            logger.error(f"LeakCheck error: {e}")
+    return list(set(emails))
 
-    # Простейший перебор популярных почтовых сервисов (можно расширить)
-    common_domains = ["gmail.com", "yahoo.com", "outlook.com", "protonmail.com", "mail.ru", "bk.ru", "inbox.ru", "list.ru"]
-    for domain in common_domains:
-        emails.append(f"{username}@{domain}")
+async def check_holehe(email: str) -> Dict[str, bool]:
+    """Проверка email через Holehe (на 120+ сервисах)."""
+    try:
+        import holehe
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(None, lambda: holehe.holehe(email))
+        if isinstance(result, dict):
+            return result
+    except Exception as e:
+        logger.error(f"Holehe ошибка: {e}")
+    return {}
 
-    return list(set(emails))  # Убираем дубликаты
-
-async def check_email_breaches(email: str) -> List[str]:
-    """Проверка email через Have I Been Pwned API (если есть ключ)."""
-    breaches = []
+async def check_hibp(email: str) -> List[str]:
+    """Утечки через Have I Been Pwned API."""
     if not HIBP_API_KEY:
-        return breaches
+        return []
     headers = {"hibp-api-key": HIBP_API_KEY, "user-agent": "FakeSherlockBot"}
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}", headers=headers) as resp:
+            async with session.get(
+                f"https://haveibeenpwned.com/api/v3/breachedaccount/{email}",
+                headers=headers, timeout=15
+            ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if isinstance(data, list):
-                        breaches = [b["Name"] for b in data]
+                    return [b["Name"] for b in data] if isinstance(data, list) else []
     except Exception as e:
-        logger.error(f"Ошибка HIBP API: {e}")
-    return breaches
+        logger.error(f"HIBP error: {e}")
+    return []
 
-async def search_telegram_channels(username: str) -> List[str]:
-    """Поиск упоминаний username в публичных Telegram-каналах через различные API."""
-    channels = []
-    # Используем Telesco.pe API (публичный)
+async def search_telegram_mentions(username: str) -> List[str]:
+    """Поиск упоминаний username в публичных каналах через Telesco.pe и Tgstat."""
+    mentions = []
     try:
-        url = f"https://telesco.pe/search?q={quote_plus(username)}"
-        html = await async_requests.get(url)
+        html = await http.get(f"https://telesco.pe/search?q={username}")
         if html:
             soup = BeautifulSoup(html, 'html.parser')
-            for link in soup.select("a[href*='t.me']"):
-                href = link.get('href')
+            for a in soup.select("a[href*='t.me']"):
+                href = a['href']
                 if href and 't.me' in href:
-                    channels.append(href)
+                    mentions.append(href)
     except Exception as e:
-        logger.error(f"Ошибка поиска каналов: {e}")
+        logger.error(f"Telesco.pe error: {e}")
 
-    # Альтернативный поиск через Tgstat
     try:
-        url = f"https://tgstat.ru/search?q={quote_plus(username)}"
-        html = await async_requests.get(url)
+        html = await http.get(f"https://tgstat.ru/search?q={username}")
         if html:
             soup = BeautifulSoup(html, 'html.parser')
-            for link in soup.select("a[href*='t.me']"):
-                href = link.get('href')
+            for a in soup.select("a[href*='t.me']"):
+                href = a['href']
                 if href and 't.me' in href:
-                    channels.append(href)
+                    mentions.append(href)
     except Exception as e:
-        logger.error(f"Ошибка поиска каналов Tgstat: {e}")
+        logger.error(f"Tgstat error: {e}")
 
-    return list(set(channels))[:20]  # Ограничиваем до 20 результатов
+    return list(set(mentions))[:15]
 
-# ----------------------------------------------------------------------
-# ФОРМАТИРОВАНИЕ ОТЧЁТОВ
-# ----------------------------------------------------------------------
+# ------------------------------------------------------------
+# Форматирование результатов
+# ------------------------------------------------------------
 
-def format_sherlock_report(results: Dict[str, str]) -> str:
-    """Форматирует результаты Sherlock в читаемый текст."""
-    if not results:
-        return ""
+def build_response(username: str, results: dict) -> str:
+    text = f"⚡️ **ДОСЬЕ на @{username}** ⚡️\n\n"
 
-    lines = ["**🌐 Найденные профили (Sherlock):**"]
-    # Группируем по категориям
-    categories = {
-        "📱 Соцсети": ["instagram", "twitter", "facebook", "vk", "tiktok", "snapchat", "youtube", "reddit", "pinterest", "tumblr"],
-        "💻 Разработка": ["github", "gitlab", "bitbucket", "stackoverflow", "codepen"],
-        "🎮 Игры": ["steam", "xbox", "playstation", "twitch", "discord"],
-        "💰 Финансы": ["paypal", "cashapp", "venmo"],
-        "🔞 Adult": ["onlyfans", "fansly", "adultfriendfinder"],
-    }
+    # 1. Sherlock
+    if "sherlock" in results and results["sherlock"]:
+        text += "**🌐 Sherlock (соцсети):**\n"
+        for site, url in list(results["sherlock"].items())[:20]:
+            text += f"  • [{site}]({url})\n"
+        if len(results["sherlock"]) > 20:
+            text += f"  ... и ещё {len(results['sherlock']) - 20}\n"
+        text += "\n"
 
-    categorized = {cat: [] for cat in categories}
-    other_sites = []
+    # 2. Socialscan
+    if "socialscan" in results and results["socialscan"]:
+        text += "**🔎 Socialscan (дополнительно):**\n"
+        text += ", ".join(results["socialscan"]) + "\n\n"
 
-    for site, url in results.items():
-        placed = False
-        for cat, keywords in categories.items():
-            if any(kw in site.lower() for kw in keywords):
-                categorized[cat].append(f"[{site}]({url})")
-                placed = True
-                break
-        if not placed:
-            other_sites.append(f"[{site}]({url})")
+    # 3. Прямые проверки
+    if "direct" in results and results["direct"]:
+        text += "**🔍 Прямые проверки:**\n"
+        for name, url in results["direct"].items():
+            text += f"  • [{name}]({url})\n"
+        text += "\n"
 
-    for cat, items in categorized.items():
-        if items:
-            lines.append(f"\n{cat}:")
-            lines.extend([f"  • {item}" for item in items])
+    # 4. Email'ы из утечек
+    if "emails" in results and results["emails"]:
+        emails = results["emails"]
+        text += f"**✉️ Найдены email'ы из утечек ({len(emails)}):**\n"
+        for e in emails[:10]:
+            text += f"  • `{e}`\n"
+        if len(emails) > 10:
+            text += f"  ... и ещё {len(emails) - 10}\n"
+        text += "\n"
 
-    if other_sites:
-        lines.append(f"\n**📎 Прочее:**")
-        lines.extend([f"  • {item}" for item in other_sites])
+    # 5. Утечки HIBP (если нашлись, то добавляются при проверке первого email'а)
+    if "hibp" in results and results["hibp"]:
+        text += "**💀 Утечки Have I Been Pwned:**\n"
+        for b in results["hibp"][:10]:
+            text += f"  • {b}\n"
+        if len(results["hibp"]) > 10:
+            text += f"  ... и ещё {len(results['hibp']) - 10}\n"
+        text += "\n"
 
-    return "\n".join(lines)
+    # 6. Упоминания в Telegram
+    if "telegram_mentions" in results and results["telegram_mentions"]:
+        text += "**📢 Найден в Telegram-каналах:**\n"
+        for link in results["telegram_mentions"][:10]:
+            text += f"  • {link}\n"
+        if len(results["telegram_mentions"]) > 10:
+            text += f"  ... и ещё {len(results['telegram_mentions']) - 10}\n"
+        text += "\n"
 
-def format_holehe_report(holehe_results: Dict[str, bool]) -> str:
-    """Форматирует результаты Holehe."""
-    if not holehe_results:
-        return ""
+    # 7. Email analysis (Holehe) - отдельно не добавляем, будет в команде /email
+    if "holehe" in results and results["holehe"]:
+        found_services = sum(1 for v in results["holehe"].values() if v)
+        text += f"**📬 Holehe (для email):** найдено {found_services} сервисов.\n\n"
 
-    found = [service for service, exists in holehe_results.items() if exists]
-    not_found_count = sum(1 for exists in holehe_results.values() if not exists)
+    if text.strip().endswith("⚡️ **ДОСЬЕ на @"):
+        text += "🤷‍♂️ Абсолютно ничего не найдено."
+    else:
+        text += "🔍 _Поиск завершён. Никакой выдумки, только реальные данные._"
+    return text
 
-    if not found:
-        return "\n**📧 Почтовые сервисы:** Аккаунтов не найдено."
+# ------------------------------------------------------------
+# Команды бота
+# ------------------------------------------------------------
 
-    lines = [f"\n**📧 Почтовые сервисы (найдено {len(found)}, не найдено {not_found_count}):**"]
-    # Показываем только найденные, для экономии места
-    for service in found[:30]:  # Ограничиваем 30 для читаемости
-        lines.append(f"  ✅ {service}")
-    if len(found) > 30:
-        lines.append(f"  ... и ещё {len(found) - 30}")
-
-    return "\n".join(lines)
-
-def build_telegram_message(username: str, report_data: dict) -> Tuple[str, Optional[InlineKeyboardMarkup]]:
-    """Собирает итоговое сообщение для отправки в Telegram."""
-    sections = []
-
-    # 1. Заголовок
-    sections.append(f"⚡️ **ДОСЬЕ на @{username}** ⚡️\n")
-
-    # 2. Социальные сети (Sherlock)
-    if report_data.get("sherlock"):
-        sherlock_text = format_sherlock_report(report_data["sherlock"])
-        if sherlock_text:
-            sections.append(sherlock_text)
-
-    # 3. Результаты Maigret (если есть)
-    if report_data.get("maigret"):
-        # Maigret может содержать очень много данных, выводим краткую сводку
-        maigret_data = report_data["maigret"]
-        if isinstance(maigret_data, dict):
-            sites_found = maigret_data.get("sites", [])
-            if sites_found:
-                sections.append(f"\n**🔎 Maigret (расширенный поиск):** Найдено {len(sites_found)} сайтов.")
-
-    # 4. Emails и их проверка
-    emails = report_data.get("emails", [])
-    if emails:
-        sections.append(f"\n**✉️ Найденные email:** {', '.join(emails[:5])}")
-        if len(emails) > 5:
-            sections.append(f"_... и ещё {len(emails) - 5}_")
-
-    # 5. Утечки (HIBP)
-    if report_data.get("breaches"):
-        breaches = report_data["breaches"]
-        sections.append(f"\n**💀 Утечки (Have I Been Pwned):**")
-        sections.extend([f"  • {b}" for b in breaches[:10]])
-        if len(breaches) > 10:
-            sections.append(f"  ... и ещё {len(breaches) - 10}")
-
-    # 6. Упоминания в Telegram-каналах
-    channels = report_data.get("channels", [])
-    if channels:
-        sections.append(f"\n**📢 Найден в Telegram-каналах:**")
-        sections.extend([f"  • {ch}" for ch in channels[:10]])
-
-    # 7. Данные из DeHashed/LeakCheck (если были получены)
-    if report_data.get("dehashed_count"):
-        sections.append(f"\n**🔓 DeHashed:** Найдено {report_data['dehashed_count']} записей.")
-
-    # 8. Футер
-    sections.append(f"\n🔍 _Данные собраны {datetime.now().strftime('%d.%m.%Y %H:%M')}_")
-
-    text = "\n".join(sections)
-
-    # Создаём кнопки для детальной информации, если она слишком большая
-    buttons = []
-    if report_data.get("sherlock") and len(str(report_data["sherlock"])) > 400:
-        buttons.append([InlineKeyboardButton("🌐 Все соцсети (подробно)", callback_data="det_sherlock")])
-    if report_data.get("emails") and len(report_data["emails"]) > 5:
-        buttons.append([InlineKeyboardButton("✉️ Все email", callback_data="det_emails")])
-    if report_data.get("breaches") and len(report_data["breaches"]) > 10:
-        buttons.append([InlineKeyboardButton("💀 Все утечки", callback_data="det_breaches")])
-
-    keyboard = InlineKeyboardMarkup(buttons) if buttons else None
-
-    # Telegram имеет лимит в 4096 символов на сообщение
-    if len(text) > 4000:
-        text = text[:4000] + "\n\n... (сообщение обрезано из-за лимита Telegram)"
-
-    return text, keyboard
-
-# ----------------------------------------------------------------------
-# ОБРАБОТЧИКИ КОМАНД
-# ----------------------------------------------------------------------
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Я **Fake Sherlock** — твой персональный OSINT-детектив.\n\n"
-        "Отправь мне команду:\n"
-        "`/sherlock @username` — для поиска информации по нику\n"
-        "`/email user@example.com` — для проверки email\n\n"
-        "Я пробью профили в соцсетях, найду утечки и упоминания. Всё, что доступно в открытых источниках.",
-        parse_mode='Markdown'
+        "👋 Я **Fake Sherlock** — OSINT-монстр.\n\n"
+        "Использую:\n"
+        "• Sherlock (400+ сайтов)\n"
+        "• Socialscan (Instagram, GitHub, Snapchat и др.)\n"
+        "• Прямые проверки VK, Steam, Twitter\n"
+        "• DeHashed / LeakCheck (email из утечек)\n"
+        "• Have I Been Pwned\n"
+        "• Поиск упоминаний в Telegram\n\n"
+        "Команды:\n"
+        "/sherlock @username\n"
+        "/email user@example.com"
     )
 
-async def sherlock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Основная команда для поиска по username."""
-    message = update.message
-    if not message or not message.text:
+async def sherlock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
         return
-
-    parts = message.text.strip().split()
+    parts = msg.text.strip().split()
     if len(parts) < 2:
-        await message.reply_text("❌ Укажите юзернейм: `/sherlock @username`", parse_mode='Markdown')
+        await msg.reply_text("❌ Укажи юзернейм: /sherlock @username")
+        return
+    username = parts[1].lstrip('@')
+    if not re.match(r'^[\w\.\_\-]{1,30}$', username):
+        await msg.reply_text("❌ Некорректный username.")
         return
 
-    raw_username = parts[1].replace('@', '').strip()
-    # Очистка от лишних символов
-    raw_username = re.sub(r'[^\w\d._-]', '', raw_username)
+    status = await msg.reply_text(f"🔎 Ищу **{username}** во всех возможных местах...")
 
-    if not raw_username:
-        await message.reply_text("❌ Некорректный юзернейм.")
+    # Параллельный запуск всех поисков
+    tasks = {
+        "sherlock": asyncio.create_task(search_sherlock(username)),
+        "socialscan": asyncio.create_task(search_socialscan(username)),
+        "direct": asyncio.create_task(direct_check_services(username)),
+        "emails": asyncio.create_task(find_emails_from_username(username)),
+        "telegram_mentions": asyncio.create_task(search_telegram_mentions(username)),
+    }
+    results = {}
+    for key, task in tasks.items():
+        try:
+            results[key] = await task
+        except Exception as e:
+            logger.error(f"Ошибка в {key}: {e}")
+
+    # Если найдены email'ы, проверяем первый через HIBP и Holehe
+    if results.get("emails"):
+        first_email = results["emails"][0]
+        hibp_task = asyncio.create_task(check_hibp(first_email))
+        holehe_task = asyncio.create_task(check_holehe(first_email))
+        try:
+            results["hibp"] = await hibp_task
+        except:
+            pass
+        try:
+            results["holehe"] = await holehe_task
+        except:
+            pass
+
+    await status.delete()
+    response = build_response(username, results)
+    await msg.reply_text(response, parse_mode='Markdown', disable_web_page_preview=True)
+
+async def email_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.message
+    if not msg or not msg.text:
         return
-
-    status_msg = await message.reply_text(f"🔎 Ищу информацию по **{raw_username}**... Это может занять до минуты.")
-
-    report = {}
-
-    # Параллельный запуск всех сборщиков
-    tasks = []
-    tasks.append(asyncio.create_task(search_sherlock(raw_username)))
-    tasks.append(asyncio.create_task(search_maigret(raw_username)))
-    tasks.append(asyncio.create_task(find_potential_emails(raw_username)))
-    tasks.append(asyncio.create_task(search_telegram_channels(raw_username)))
-
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    sherlock_results, maigret_results, emails, channels = results
-
-    if isinstance(sherlock_results, dict) and sherlock_results:
-        report["sherlock"] = sherlock_results
-    if isinstance(maigret_results, dict) and maigret_results:
-        report["maigret"] = maigret_results
-    if isinstance(emails, list) and emails:
-        report["emails"] = emails
-        # Для первого найденного email проверяем утечки
-        if emails and HIBP_API_KEY:
-            breaches = await check_email_breaches(emails[0])
-            if breaches:
-                report["breaches"] = breaches
-    if isinstance(channels, list) and channels:
-        report["channels"] = channels
-
-    # Удаляем статусное сообщение
-    await status_msg.delete()
-
-    if not any([report.get("sherlock"), report.get("maigret"), report.get("emails"), report.get("channels")]):
-        await message.reply_text(f"🤷‍♂️ По нику **{raw_username}** ничего не найдено. Либо пользователь очень скрытный, либо ник не используется.")
-        return
-
-    text, keyboard = build_telegram_message(raw_username, report)
-    await message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True, reply_markup=keyboard)
-
-async def email_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Поиск по email."""
-    message = update.message
-    if not message or not message.text:
-        return
-
-    parts = message.text.strip().split()
+    parts = msg.text.strip().split()
     if len(parts) < 2:
-        await message.reply_text("❌ Укажите email: `/email user@example.com`", parse_mode='Markdown')
+        await msg.reply_text("❌ Укажи email: /email user@example.com")
+        return
+    email = parts[1]
+    if "@" not in email:
+        await msg.reply_text("❌ Некорректный email.")
         return
 
-    email = parts[1].strip()
+    status = await msg.reply_text(f"📧 Проверяю **{email}**...")
 
-    if not re.match(r"[^@]+@[^@]+\.[^@]+", email):
-        await message.reply_text("❌ Некорректный email.")
-        return
+    holehe_task = asyncio.create_task(check_holehe(email))
+    hibp_task = asyncio.create_task(check_hibp(email))
 
-    status_msg = await message.reply_text(f"📧 Проверяю **{email}**...")
+    holehe_result = await holehe_task
+    hibp_result = await hibp_task
 
-    tasks = []
-    tasks.append(asyncio.create_task(check_holehe(email)))
-    tasks.append(asyncio.create_task(check_email_breaches(email)))
+    await status.delete()
 
-    holehe_results, breaches = await asyncio.gather(*tasks, return_exceptions=True)
+    text = f"⚡️ **ДОСЬЕ на email {email}** ⚡️\n\n"
 
-    await status_msg.delete()
+    if holehe_result:
+        found = [s for s, v in holehe_result.items() if v]
+        not_found = len(holehe_result) - len(found)
+        text += f"**📬 Holehe (проверка на сервисах):**\n"
+        if found:
+            text += "Найден на:\n" + "\n".join([f"  ✅ {s}" for s in found]) + "\n"
+        else:
+            text += "  ❌ Не найден ни на одном сервисе.\n"
+        text += f"Всего проверено {len(holehe_result)} сервисов.\n\n"
+    else:
+        text += "**📬 Holehe:** не удалось выполнить проверку.\n\n"
 
-    text = f"⚡️ **ДОСЬЕ на email {email}** ⚡️\n"
+    if hibp_result:
+        text += f"**💀 Утечки (HIBP):**\n" + "\n".join([f"  • {b}" for b in hibp_result]) + "\n\n"
+    elif HIBP_API_KEY:
+        text += "**💀 Утечек не найдено.**\n\n"
+    else:
+        text += "**💀 HIBP:** укажи API-ключ в переменных окружения для проверки утечек.\n\n"
 
-    if isinstance(holehe_results, dict) and holehe_results:
-        text += format_holehe_report(holehe_results)
+    await msg.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
 
-    if isinstance(breaches, list) and breaches:
-        text += f"\n\n**💀 Утечки:**\n"
-        text += "\n".join([f"  • {b}" for b in breaches])
-
-    if not any([isinstance(holehe_results, dict) and holehe_results, isinstance(breaches, list) and breaches]):
-        text += "\n🤷‍♂️ Никакой информации не найдено."
-
-    await message.reply_text(text, parse_mode='Markdown', disable_web_page_preview=True)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатий на инлайн-кнопки."""
-    query = update.callback_query
-    await query.answer()
-
-    # Здесь можно реализовать выдачу детальной информации по запросу
-    if query.data == "det_sherlock":
-        await query.message.reply_text("🔍 Детальная информация по соцсетям будет доступна в следующем обновлении.")
-    elif query.data == "det_emails":
-        await query.message.reply_text("✉️ Полный список email пока в разработке.")
-    elif query.data == "det_breaches":
-        await query.message.reply_text("💀 Полный список утечек пока в разработке.")
-
-# ----------------------------------------------------------------------
-# ТОЧКА ВХОДА
-# ----------------------------------------------------------------------
-
+# ------------------------------------------------------------
+# Точка входа
+# ------------------------------------------------------------
 def main():
-    """Запуск бота."""
-    if not BOT_TOKEN:
-        logger.error("BOT_TOKEN не задан. Бот не может быть запущен.")
-        return
-
     app = Application.builder().token(BOT_TOKEN).build()
-
-    # Регистрация обработчиков
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("sherlock", sherlock_command))
-    app.add_handler(CommandHandler("email", email_command))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("sherlock", sherlock_cmd))
+    app.add_handler(CommandHandler("email", email_cmd))
     logger.info("Fake Sherlock запущен и готов к работе!")
     app.run_polling()
 
