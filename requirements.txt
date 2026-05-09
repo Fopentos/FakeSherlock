@@ -1,8 +1,4 @@
-python-telegram-bot>=20.0
-sherlock-project
-holehe
-aiohttp
-beautifulsoup4
-fake-useragent
-requests
-socialscan
+python-telegram-bot==20.7
+sqlalchemy==2.0.23
+psycopg2-binary==2.9.9
+apscheduler==3.10.4
